@@ -5,6 +5,40 @@ from flask import Flask, Response, render_template_string
 import threading
 import time
 import os
+import smtplib
+from email.message import EmailMessage
+from email.header import Header
+from pathlib import Path
+def send_gmail(img_path):
+    SMTP_SERVER = "smtp.gmail.com"
+    SMTP_PORT = 587
+    GMAIL_USER = os.environ.get("GMAIL_USER")
+    GMAIL_PASS = os.environ.get("GMAIL_PASS")
+    print(GMAIL_USER, GMAIL_PASS)
+    subject = "警告: 非主人臉部偵測"
+    body = "這是一封自動警告通知，偵測到非主人的臉部。請查閱附件圖片。"
+    to_email = "ernestii260928@gmail.com"
+
+    msg = EmailMessage()
+    msg["Subject"] = str(Header(subject, "utf-8"))
+    msg["From"] = GMAIL_USER
+    msg["To"] = to_email
+    msg.set_content(body, subtype="plain", charset="utf-8")
+
+    with open(img_path, "rb") as f:
+        file_data = f.read()
+        file_name = Path(img_path).name
+    msg.add_attachment(
+        file_data,
+        maintype="image",
+        subtype="jpeg",
+        filename=(Header(file_name, "utf-8").encode())
+    )
+
+    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=20) as server:
+        server.starttls()
+        server.login(GMAIL_USER, GMAIL_PASS)
+        server.send_message(msg)
 
 # Paths
 FACE_DETECT_MODEL = os.path.join(os.path.dirname(__file__), 'yolo_face_detect.tflite')
@@ -194,6 +228,7 @@ def camera_loop():
 
     import logging
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
+    import tempfile
     cap = cv2.VideoCapture(0)
     while True:
         ret, frame = cap.read()
@@ -246,6 +281,14 @@ def camera_loop():
             else:
                 logging.info(f"Not owner's face detected (score={sim:.3f})")
                 non_owner_faces.append(face_img)
+                # Send non-owner face via Gmail
+                with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
+                    cv2.imwrite(tmp.name, face_img)
+                    try:
+                        send_gmail(tmp.name)
+                        logging.info(f"Sent non-owner face via Gmail: {tmp.name}")
+                    except Exception as e:
+                        logging.error(f"Failed to send Gmail: {e}")
             # Draw box
             color = (0,255,0) if sim <= 0.4 else (0,0,255)
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
