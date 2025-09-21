@@ -1,3 +1,32 @@
+def send_gmail_blackout(img_path):
+    SMTP_SERVER = "smtp.gmail.com"
+    SMTP_PORT = 587
+    GMAIL_USER = os.environ.get("GMAIL_USER")
+    GMAIL_PASS = os.environ.get("GMAIL_PASS")
+    subject = "警告: 攝影機疑似被遮蔽!"
+    body = "自動警告：攝影機畫面長時間過暗，可能遭遮蔽或破壞，請立即檢查現場安全。"
+    to_email = "ernestii260928@gmail.com"
+
+    msg = EmailMessage()
+    msg["Subject"] = str(Header(subject, "utf-8"))
+    msg["From"] = GMAIL_USER
+    msg["To"] = to_email
+    msg.set_content(body, subtype="plain", charset="utf-8")
+
+    with open(img_path, "rb") as f:
+        file_data = f.read()
+        file_name = Path(img_path).name
+    msg.add_attachment(
+        file_data,
+        maintype="image",
+        subtype="jpeg",
+        filename=(Header(file_name, "utf-8").encode())
+    )
+
+    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=20) as server:
+        server.starttls()
+        server.login(GMAIL_USER, GMAIL_PASS)
+        server.send_message(msg)
 import cv2
 import numpy as np
 import tflite_runtime.interpreter as tflite
@@ -74,17 +103,24 @@ def load_owner_embedding(recog_interpreter, input_scale, input_zero_point):
 app = Flask(__name__)
 latest_frame = None
 latest_non_owner_faces = []
+blackout_countdown = 0
 
 @app.route('/')
 def index():
+    global blackout_countdown
     return render_template_string('''
         <h1>Camera Feed</h1>
         <img src="/video_feed" width="480"/><br>
+        {% if blackout_countdown > 0 %}
+            <div style="color:red;font-size:1.5em;">
+                <b>警告：攝影機畫面過暗，{{ blackout_countdown }} 秒後將發送遮蔽警報！</b>
+            </div>
+        {% endif %}
         <h2>Non-owner Faces</h2>
         {% for idx in range(non_owner_count) %}
             <img src="/non_owner_face/{{idx}}" width="160"/>
         {% endfor %}
-    ''', non_owner_count=len(latest_non_owner_faces))
+    ''', non_owner_count=len(latest_non_owner_faces), blackout_countdown=blackout_countdown)
 
 @app.route('/video_feed')
 def video_feed():
@@ -105,6 +141,11 @@ def non_owner_face(idx):
 
 def camera_loop():
     global latest_frame, latest_non_owner_faces
+    global blackout_countdown
+    BLACKOUT_THRESHOLD = 40  # average pixel value below this is considered black
+    BLACKOUT_SECONDS = 10
+    blackout_start = None
+    blackout_countdown = 0
     # Load TFLite models
     face_interpreter = tflite.Interpreter(model_path=FACE_DETECT_MODEL)
     face_interpreter.allocate_tensors()
@@ -235,7 +276,34 @@ def camera_loop():
         if not ret:
             continue
         logging.info('Got image')
-        # Face detection preprocessing
+        # Blackout detection
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        avg_brightness = np.mean(gray)
+        if avg_brightness < BLACKOUT_THRESHOLD:
+            if blackout_start is None:
+                blackout_start = time.time()
+            blackout_countdown = max(0, BLACKOUT_SECONDS - int(time.time() - blackout_start))
+            logging.info(f"Camera blackout detected. Countdown: {blackout_countdown}s (brightness={avg_brightness:.1f})")
+            if time.time() - blackout_start >= BLACKOUT_SECONDS:
+                # Send blackout alert email
+                blackout_img_path = os.path.join(os.path.dirname(__file__), 'blackout.jpg')
+                cv2.imwrite(blackout_img_path, frame)
+                try:
+                    send_gmail_blackout(blackout_img_path)
+                    logging.info("Sent blackout alert email.")
+                except Exception as e:
+                    logging.error(f"Failed to send blackout Gmail: {e}")
+                blackout_start = None
+                blackout_countdown = 0
+            # Skip face detection if blackout
+            latest_frame = frame.copy()
+            latest_non_owner_faces = []
+            time.sleep(0.05)
+            continue
+        else:
+            blackout_start = None
+            blackout_countdown = 0
+        # ...existing code for face detection and recognition...
         logging.info('Performing detection')
         _, H, W, C = face_input_shape
         resized = image_resize(frame, (W, H))
