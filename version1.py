@@ -104,10 +104,19 @@ app = Flask(__name__)
 latest_frame = None
 latest_non_owner_faces = []
 blackout_countdown = 0
+last_owner_time_display = 0
+last_non_owner_time_display = 0
+last_email_sent_time = 0
+last_email_sent_type = ''
 
 @app.route('/')
 def index():
     global blackout_countdown
+    global last_owner_time_display, last_non_owner_time_display, last_email_sent_time, last_email_sent_type
+    now = time.time()
+    owner_show_time = f"{int(now - last_owner_time_display)} 秒前" if last_owner_time_display > 0 else "尚未偵測"
+    non_owner_show_time = f"{int(now - last_non_owner_time_display)} 秒前" if last_non_owner_time_display > 0 else "尚未偵測"
+    email_sent_status = f"{last_email_sent_type} ({time.strftime('%H:%M:%S', time.localtime(last_email_sent_time))})" if last_email_sent_time > 0 else "尚未發送"
     return render_template_string('''
         <h1>Camera Feed</h1>
         <img src="/video_feed" width="480"/><br>
@@ -116,11 +125,23 @@ def index():
                 <b>警告：攝影機畫面過暗，{{ blackout_countdown }} 秒後將發送遮蔽警報！</b>
             </div>
         {% endif %}
+        <h2>狀態顯示</h2>
+        <ul>
+            <li>主人最後偵測時間: <b>{{ owner_show_time }}</b></li>
+            <li>非主人最後偵測時間: <b>{{ non_owner_show_time }}</b></li>
+            <li>最近一次 Email 發送: <b>{{ email_sent_status }}</b></li>
+        </ul>
         <h2>Non-owner Faces</h2>
         {% for idx in range(non_owner_count) %}
             <img src="/non_owner_face/{{idx}}" width="160"/>
         {% endfor %}
-    ''', non_owner_count=len(latest_non_owner_faces), blackout_countdown=blackout_countdown)
+    ''',
+        non_owner_count=len(latest_non_owner_faces),
+        blackout_countdown=blackout_countdown,
+        owner_show_time=owner_show_time,
+        non_owner_show_time=non_owner_show_time,
+        email_sent_status=email_sent_status
+    )
 
 @app.route('/video_feed')
 def video_feed():
@@ -271,6 +292,10 @@ def camera_loop():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
     import tempfile
     cap = cv2.VideoCapture(0)
+    last_owner_time = 0
+    last_non_owner_alert_time = 0
+    NON_OWNER_ALERT_COOLDOWN = 10
+    global last_owner_time_display, last_non_owner_time_display, last_email_sent_time, last_email_sent_type
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -279,18 +304,21 @@ def camera_loop():
         # Blackout detection
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         avg_brightness = np.mean(gray)
+        now = time.time()
         if avg_brightness < BLACKOUT_THRESHOLD:
             if blackout_start is None:
-                blackout_start = time.time()
-            blackout_countdown = max(0, BLACKOUT_SECONDS - int(time.time() - blackout_start))
+                blackout_start = now
+            blackout_countdown = max(0, BLACKOUT_SECONDS - int(now - blackout_start))
             logging.info(f"Camera blackout detected. Countdown: {blackout_countdown}s (brightness={avg_brightness:.1f})")
-            if time.time() - blackout_start >= BLACKOUT_SECONDS:
+            if now - blackout_start >= BLACKOUT_SECONDS:
                 # Send blackout alert email
                 blackout_img_path = os.path.join(os.path.dirname(__file__), 'blackout.jpg')
                 cv2.imwrite(blackout_img_path, frame)
                 try:
                     send_gmail_blackout(blackout_img_path)
                     logging.info("Sent blackout alert email.")
+                    last_email_sent_time = time.time()
+                    last_email_sent_type = '遮蔽警報'
                 except Exception as e:
                     logging.error(f"Failed to send blackout Gmail: {e}")
                 blackout_start = None
@@ -334,6 +362,7 @@ def camera_loop():
         logging.info(f'Detected {len(found_objects)} faces')
         h, w, _ = frame.shape
         non_owner_faces = []
+        owner_detected = False
         for idx, box in enumerate(found_objects):
             x1, y1, x2, y2 = [int(box[i]) for i in range(4)]
             if x2-x1 < 10 or y2-y1 < 10:
@@ -346,17 +375,33 @@ def camera_loop():
             sim = cosine_similarity(owner_embedding, embedding)
             if sim <= 0.4:
                 logging.info(f"Owner's face detected (score={sim:.3f})")
+                last_owner_time = now
+                last_owner_time_display = now
+                owner_detected = True
             else:
                 logging.info(f"Not owner's face detected (score={sim:.3f})")
                 non_owner_faces.append(face_img)
-                # Send non-owner face via Gmail
-                with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
-                    cv2.imwrite(tmp.name, face_img)
-                    try:
-                        send_gmail(tmp.name)
-                        logging.info(f"Sent non-owner face via Gmail: {tmp.name}")
-                    except Exception as e:
-                        logging.error(f"Failed to send Gmail: {e}")
+                last_non_owner_time_display = now
+                # Only send email if:
+                # 1. No owner's face detected in last 5 seconds
+                # 2. No owner's face detected for next 5 seconds (wait and check)
+                # 3. Not sent in last 10 seconds
+                if (now - last_owner_time > 5 and now - last_non_owner_alert_time > NON_OWNER_ALERT_COOLDOWN):
+                    # Wait 5 seconds to confirm no owner's face
+                    logging.info("Waiting 5 seconds to confirm no owner's face before sending alert...")
+                    time.sleep(5)
+                    now2 = time.time()
+                    if now2 - last_owner_time > 5:
+                        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
+                            cv2.imwrite(tmp.name, face_img)
+                            try:
+                                send_gmail(tmp.name)
+                                logging.info(f"Sent non-owner face alert email: {tmp.name}")
+                                last_non_owner_alert_time = time.time()
+                                last_email_sent_time = last_non_owner_alert_time
+                                last_email_sent_type = '非主人警報'
+                            except Exception as e:
+                                logging.error(f"Failed to send Gmail: {e}")
             # Draw box
             color = (0,255,0) if sim <= 0.4 else (0,0,255)
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
